@@ -96,6 +96,7 @@ local waveformParts = {
 	"rbxassetid://102911029991151",
 }
 local numWaveformParts = #waveformParts
+local faderThreshold = mixer:GetAttribute("IsNewGeneration") and 50 or 275
 
 SCREEN.Changable.PlayerNumber.PlayerNumber.Text = PlayerNumber
 LEDS["JOGWHEEL RING LED"].Color = Color3.fromRGB(220, 0, 0)
@@ -688,7 +689,7 @@ LEDS["RELOOP"].ClickDetector.MouseClick:Connect(clearLoop)
 
 mixer.FaderStatus.Event:Connect(function(deckNumber: number, faderValue: number)
 	if deckNumber ~= PlayerNumber then return end
-	local faderThreshold = 275
+	
 	local jogwheelLightColor = faderValue >= faderThreshold and Color3.fromRGB(220, 0, 0) or Color3.fromRGB(200, 200, 200)
 	LEDS["JOGWHEEL RING LED"].Color = jogwheelLightColor
 

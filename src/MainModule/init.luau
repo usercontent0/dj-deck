@@ -1,15 +1,22 @@
 local DJDECK = {}
 local CONTENTS = script.Contents
+local EVENTS = script.Events
 
 local function copyContents(oldParent: Instance, newParent: Instance)
 	for _,child in oldParent:GetChildren() do
 		local clone = child:Clone()
-		if oldParent.Name:find("MIXER")	then
-			CONTENTS.ModuleLoader:Clone().Parent = clone
-		end
+
+		if oldParent.Name:find("MIXER")	then CONTENTS.ModuleLoader:Clone().Parent = clone end
 		clone.Parent = newParent
 	end
+
+	if oldParent.Name:find("MIXER")	then
+		for _,event in EVENTS[newParent:GetAttribute("IsNewGeneration") and "MixerNew" or "Mixer"]:GetChildren() do event:Clone().Parent = newParent end
+	else
+		for _,event in EVENTS["Deck"]:GetChildren() do event:Clone().Parent = newParent end
+	end
 end
+
 
 local availableUsbColors = {
 	Color3.fromRGB(177, 125, 182),
@@ -39,7 +46,13 @@ function DJDECK:Initialize(deckModel: Model)
 		end
 	end
 	
-	copyContents(XONE and CONTENTS[`MIXER_XONE`] or CONTENTS[`MIXER_{CHANNELS}CHANNEL`], MIXER)
+	local isNewMixer = MIXER:GetAttribute("IsNewGeneration")
+	if isNewMixer then
+		copyContents(CONTENTS[`MIXER_{CHANNELS}CHANNEL_NEW`], MIXER)
+	else
+		copyContents(XONE and CONTENTS[`MIXER_XONE`] or CONTENTS[`MIXER_{CHANNELS}CHANNEL`], MIXER)
+	end
+
 	for deckNum = 1, #DECKS do
 		local isNewDeck = DECKS[deckNum]:GetAttribute("IsNewGeneration")
 		copyContents(CONTENTS[isNewDeck and "DECK_NEW" or "DECK"], DECKS[deckNum])
