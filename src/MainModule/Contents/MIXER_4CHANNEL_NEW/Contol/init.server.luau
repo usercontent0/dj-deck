@@ -135,9 +135,7 @@ local blueOffColor = Color3.fromRGB(41, 72, 100)
 local cueOnColor = Color3.fromRGB(160, 116, 58)
 local cueOffColor = Color3.fromRGB(100, 86, 69)
 
-local beatFxLoop = nil
 local beatFxDeb = false
-
 local beatFxButton = LEDS["BEAT FX CHANNEL 1"]
 local colorFxButton = nil
 local micFxButton = nil
@@ -493,4 +491,4 @@ script.Parent.Headphones.ClickDetector.MouseClick:Connect(function(player: Playe
 	end
 end)
 
-print(`mixer init (newgen)`)
+print(`mixer init (new gen)`)

@@ -2,6 +2,7 @@ local runService = game:GetService("RunService")
 local httpService = game:GetService("HttpService")
 
 local Master = script:FindFirstAncestor("DJDECK")
+local Deck = script.Parent
 local mixer = Master:WaitForChild("mixer")
 local LEDS = script.Parent.LEDS
 
@@ -34,10 +35,25 @@ local SCREEN = LEDS.SCREEN.Screen.Background
 local bigRemaining, smallRemaining = SCREEN.Changable.TimeRemaining.BigNum, SCREEN.Changable.TimeRemaining.SmallNum
 local Waveform = SCREEN.Waveform.MainWaveform
 
+local BarsCounter = SCREEN.Changable.BarsCounter
+local MasterBars = BarsCounter.MasterBars
+local SlaveBars = BarsCounter.SlaveBars
+local MasterBarsNum = BarsCounter.MasterBarsNum
+local SlaveBarsNum = BarsCounter.SlaveBarsNum
+
 local images = {}
 local isPlaying = false
 local currentSong = nil
 local isSlip = false
+
+type BeatState = {bpm: number, elapsedMs: number, totalMs: number}
+local barsScrollSpeed = 160
+local barsPxPerMs = barsScrollSpeed / 1000
+local beatsPerBar = 4
+local barLinePools = {}
+local masterDeck = nil
+local masterDeckNumber = nil
+local published = {playing = false, bpm = 0, elapsedMs = 0, clock = 0}
 
 local refreshRate = 30
 local jogwheelRpm = 33
@@ -57,11 +73,7 @@ local wasPlaying = false
 local canSetWasPlaying = true
 local setRemainingMs
 
-local bLoopStates = {
-	inMs = nil,
-	outMs = nil,
-	active = false
-}
+local bLoopStates = {inMs = nil, outMs = nil, active = false}
 local bLoopLed = nil
 local onAirLoop = nil
 local waveformLoop = nil
@@ -77,9 +89,10 @@ local originalImageWidth = 146
 local imageWidth = originalImageWidth
 
 local waveformSpeed = 2.5
-local numVisibleImages = 12
+local minTempoScale, maxTempoScale = .25, 2
 local currentImage = 1
 local xPos = 0
+local lastFaderValue = 0
 
 local waveformParts = {
 	"rbxassetid://133642711259129",
@@ -98,15 +111,62 @@ local waveformParts = {
 local numWaveformParts = #waveformParts
 local faderThreshold = mixer:GetAttribute("IsNewGeneration") and 50 or 275
 
+local function getWaveformWidth(): number
+	local width = Waveform.AbsoluteSize.X
+	if width <= 0 then width = Waveform.Size.X.Offset end
+	return width > 0 and width or 1280
+end
+
+local minImageWidth = originalImageWidth / maxTempoScale
+local imagePoolSize = math.ceil((math.ceil(getWaveformWidth() / minImageWidth) + 2) / numWaveformParts) * numWaveformParts
+
 SCREEN.Changable.PlayerNumber.PlayerNumber.Text = PlayerNumber
 LEDS["JOGWHEEL RING LED"].Color = Color3.fromRGB(220, 0, 0)
 
-local function resetWaveformPosition()
-	local waveformCenter = Waveform.AbsoluteSize.X/2
-	for wIndex = 1, #images do
-		images[wIndex].Position = UDim2.new(0, waveformCenter + (wIndex-1) * imageWidth, .5, 0)
+local function createBeatLine(): Frame
+	local barLine = Instance.new("Frame")
+	barLine.BackgroundColor3 = Color3.new(1, 1, 1)
+	barLine.BorderSizePixel = 0
+	barLine.Size = UDim2.fromOffset(2, 13)
+	return barLine
+end
+
+local function createBarLine(): Frame
+	local beatLine = Instance.new("Frame")
+	beatLine.BackgroundColor3 = Color3.fromRGB(238, 45, 42)
+	beatLine.BorderSizePixel = 0
+	beatLine.Size = UDim2.fromOffset(2, 31)
+	return beatLine
+end
+
+local function layoutWaveform()
+	local total = #images
+	if total == 0 then return end
+	local visible = math.clamp(math.ceil(getWaveformWidth() / imageWidth) + 2, 1, total)
+
+	for index = 0, total - 1 do
+		local image = images[(currentImage + index-1) % total + 1]
+		image.Visible = index < visible
+		if index < visible then image.Position = UDim2.new(0, xPos + index*imageWidth, .5, 0) end
 	end
-	xPos = waveformCenter; currentImage = 1
+end
+
+local function advanceWaveform(pixels: number)
+	local total = #images
+	if total == 0 then return end
+
+	xPos -= pixels
+	while xPos <= -imageWidth do
+		xPos += imageWidth
+		currentImage = currentImage % total + 1
+	end
+
+	layoutWaveform()
+end
+
+local function resetWaveformPosition()
+	xPos = getWaveformWidth()/2; currentImage = 1
+	layoutWaveform()
 end
 
 local function getTotalMs(): number
@@ -138,20 +198,18 @@ local function getCurrentMs(): number
 end
 
 local function jumpWaveformToMs(targetMs: number)
+    local total = #images
+    if total == 0 then return end
+
     local ppm = (waveformSpeed * refreshRate) / 1000 --pixels per millisecond
-    local center = Waveform.AbsoluteSize.X / 2
+    local center = getWaveformWidth() / 2
 
     local rawX = center - (targetMs * ppm)
     local wraps = math.max(0, math.floor((-rawX) / imageWidth))
 
     xPos = rawX + wraps*imageWidth
-    currentImage = (wraps % numWaveformParts) + 1
-
-    for index = 0, numVisibleImages - 1 do
-        local imageIndex = currentImage + index
-        if imageIndex > numWaveformParts then imageIndex -= numWaveformParts end
-        images[imageIndex].Position = UDim2.new(0, xPos + index*imageWidth, .5, 0)
-    end
+    currentImage = (wraps % total) + 1
+    layoutWaveform()
 end
 
 local function rotateJogwheelByMs(deltaMs: number)
@@ -186,12 +244,160 @@ local function updateLoopOverlay()
     local widthPx = math.max(2, math.floor((bLoopStates.outMs - bLoopStates.inMs) * ppm + .5))
 
     local currentMs = getCurrentMs()
-    local center = Waveform.AbsoluteSize.X/2
+    local center = getWaveformWidth()/2
     local xStart = center + (bLoopStates.inMs - currentMs) * ppm
 
     overlay.Visible = true
     overlay.Position = UDim2.fromOffset(xStart, 0)
 	overlay.Size = UDim2.new(0, widthPx, 1, 0)
+end
+
+local function getCanvasWidth(canvas: Frame): number
+	local width = canvas.AbsoluteSize.X
+	if width <= 0 then width = canvas.Size.X.Offset end
+	return width > 0 and width or 200
+end
+
+local function getLinePool(canvas: Frame, needed: number): {Frame}
+	local pool = barLinePools[canvas]
+	if not pool then pool = {}; barLinePools[canvas] = pool end
+	local wanted = math.ceil(math.max(needed, 1) / beatsPerBar) * beatsPerBar
+
+	for index = #pool + 1, wanted do
+		local line = (index-1) % beatsPerBar == 0 and createBarLine() or createBeatLine()
+		line.Name = `BeatLine{index}`
+		line.AnchorPoint = Vector2.new(.5, .5)
+		line.Position = UDim2.fromScale(2, .5)
+		line.Visible = false
+		line.Parent = canvas
+		pool[index] = line
+	end
+
+	return pool
+end
+
+local function clearBarLines(canvas: Frame)
+	local pool = barLinePools[canvas]
+	if not pool then return end
+	for _,line in pool do line.Visible = false end
+end
+
+local function renderBars(canvas: Frame, numLabel: TextLabel, state: BeatState?)
+	if not state then clearBarLines(canvas); numLabel.Text = "--.-"; return end
+
+	local beatMs = 60_000 / state.bpm
+	local width = getCanvasWidth(canvas)
+	local center = width/2
+	local elapsed = state.elapsedMs
+
+	local totalBeats = math.max(state.totalMs // beatMs, 0)
+	local firstBeat = math.max(math.ceil((elapsed - center / barsPxPerMs) / beatMs), 0)
+	local lastBeat = math.min((elapsed + (width-center) / barsPxPerMs) // beatMs, totalBeats)
+
+	local pool = getLinePool(canvas, lastBeat - firstBeat+2)
+	local poolSize = #pool
+	local shown = {}
+	local phase = totalBeats % beatsPerBar
+
+	for beat = firstBeat, lastBeat do
+		local slot = (beat - phase) % poolSize + 1
+		local line = pool[slot]
+
+		line.Position = UDim2.new(0, center + (beat*beatMs - elapsed)*barsPxPerMs, .5, 0)
+		line.Visible = true
+		shown[slot] = true
+	end
+
+	for index, line in pool do if not shown[index] then line.Visible = false end end
+	
+	local beatsLeft = math.max(totalBeats - elapsed // beatMs, 1)
+	local barsLeft = math.ceil(beatsLeft / beatsPerBar)
+	local beatInBar = (beatsLeft-1) % beatsPerBar + 1
+	numLabel.Text = string.format(`%.{(barsLeft-1) >= 100 and "3" or "2"}i.%i`, barsLeft-1, beatInBar)
+end
+
+local function getSelfBeatState(): BeatState?
+	if not isPlaying or not currentSong then return nil end
+
+	local bpm = currentBPM * (1+tempoMultiplier)
+	if bpm <= 0 then return nil end
+
+	return {bpm = bpm, elapsedMs = getCurrentMs(), totalMs = getTotalMs()}
+end
+
+local function resolveMasterDeck()
+	local settings = Master:GetAttribute("MasterSettings")
+	if not settings or settings == "" then
+		masterDeckNumber = nil; masterDeck = nil; return
+	end
+
+	local decoded = httpService:JSONDecode(settings)
+	if masterDeckNumber == decoded.MasterDeck and masterDeck and masterDeck.Parent then return end
+
+	masterDeckNumber = decoded.MasterDeck
+	masterDeck = nil
+
+	for _,child in Master:GetChildren() do
+		if child:GetAttribute("PlayerNumber") == masterDeckNumber then masterDeck = child; break end
+	end
+end
+
+local function getMasterBeatState(): BeatState?
+	if not masterDeckNumber then return nil end
+	if masterDeckNumber == PlayerNumber then return getSelfBeatState() end
+	if not masterDeck or not masterDeck.Parent then return nil end
+	if not masterDeck:GetAttribute("BeatPlaying") then return nil end
+
+	local bpm = masterDeck:GetAttribute("BeatBPM")
+	local elapsedMs = masterDeck:GetAttribute("BeatElapsedMs")
+	local totalMs = masterDeck:GetAttribute("BeatTotalMs")
+	local clock = masterDeck:GetAttribute("BeatClock")
+	
+	if not bpm or bpm <= 0 or not elapsedMs or not totalMs or not clock then return nil end
+	return {bpm = bpm, elapsedMs = math.clamp(elapsedMs + (os.clock()-clock)*1000, 0, totalMs), totalMs = totalMs}
+end
+
+local function syncBeatState()
+	local playing = isPlaying and currentSong ~= nil
+	local bpm = currentBPM * (1+tempoMultiplier)
+	local elapsedMs = currentSong and getCurrentMs() or 0
+	local totalMs = currentSong and getTotalMs() or 0
+
+	local now = os.clock()
+	local predicted = published.elapsedMs + (published.playing and (now - published.clock)*1000 or 0)
+	local moved = math.abs(elapsedMs - predicted) > 120 and (now - published.clock) >= .1
+
+	if playing == published.playing and bpm == published.bpm and not moved then return end
+
+	published.playing = playing
+	published.bpm = bpm
+	published.elapsedMs = elapsedMs
+	published.clock = now
+
+	Deck:SetAttribute("BeatPlaying", playing)
+	Deck:SetAttribute("BeatBPM", bpm)
+	Deck:SetAttribute("BeatElapsedMs", elapsedMs)
+	Deck:SetAttribute("BeatTotalMs", totalMs)
+	Deck:SetAttribute("BeatClock", now)
+end
+
+local function startWaveformLoop()
+	if waveformLoop then return end
+	local counter = 0
+	local rate = 1 / refreshRate
+
+	waveformLoop = runService.Heartbeat:Connect(function(deltaTime)
+		counter += deltaTime
+
+		while counter >= rate do
+			counter -= rate
+			advanceWaveform(waveformSpeed)
+
+			LEDS["JOGWHEEL LED"].LED.ROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
+			LEDS["JOGWHEEL LED"].LED.SLIPROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
+			updateLoopOverlay()
+		end
+	end)
 end
 
 local function toggleLoopUi(state: boolean)
@@ -214,7 +420,7 @@ local function clearLoop()
     LEDS["LOOP OUT"].Color = Color3.fromRGB(172, 125, 63)
 	LEDS["RELOOP LED"].Color = Color3.fromRGB(25, 25, 25)
 
-    local overlay = SCREEN.Waveform:FindFirstChild("LoopOverlay")
+    local overlay = Waveform:FindFirstChild("LoopOverlay")
     if overlay then overlay:Destroy() end
 end
 
@@ -253,18 +459,22 @@ local function changeBPM(bpm: number)
 	BPMMaster.SmallNum.Text = tenth
 end
 
+local function applyWaveformScale()
+	local tempoScale = math.clamp(1 + tempoMultiplier, minTempoScale, maxTempoScale)
+	imageWidth = originalImageWidth / tempoScale
+
+	for wIndex = 1, #images do images[wIndex].Size = UDim2.new(0, imageWidth, 1, 0) end
+	layoutWaveform()
+end
+
 local function changeTempo(percentage: number)
 	if bypassTempo then return end
 	local Tempo = SCREEN.Changable.Tempo
 
 	tempoMultiplier = percentage/100
-	imageWidth = originalImageWidth * (1-tempoMultiplier)
 	changeBPM(currentBPM * (1+tempoMultiplier))
+	applyWaveformScale()
 
-	for wIndex = 1, #images do
-		images[wIndex].Size = UDim2.new(0, imageWidth, 1, 0)
-	end
-	
 	Tempo.BigNum.Text = string.format("%.2f", math.abs(percentage))
 	Tempo.Sign.Text = percentage ~= 0 and (percentage < 0 and "-" or percentage > 0 and "+") or ""
 end
@@ -491,6 +701,19 @@ if not onAirLoop then
 	end); onAirLoop()
 end
 
+for ID = 1, imagePoolSize do
+	local newImage = Instance.new("ImageLabel")
+	newImage.Image = waveformParts[(ID-1) % numWaveformParts + 1]
+	newImage.Parent = Waveform
+	newImage.Name = ID
+	newImage.BackgroundTransparency = 1
+	newImage.AnchorPoint = Vector2.new(0, .5)
+	newImage.Size = UDim2.new(0, imageWidth, 1, 0)
+	newImage.Position = UDim2.fromScale(2, 2)
+	newImage.Visible = false
+	images[ID] = newImage
+end
+
 changeTrack()
 
 countdown = startCountdown({minutes = currentSong.length.minutes, seconds = currentSong.length.seconds})
@@ -499,47 +722,28 @@ countdown:Connect(function()
 	countdown = startCountdown({minutes = currentSong.length.minutes, seconds = currentSong.length.seconds})
 end)
 
-for ID = 1, numWaveformParts do
-	local newImage = Instance.new("ImageLabel")
-	newImage.Image = waveformParts[ID]
-	newImage.Parent = Waveform
-	newImage.Name = ID
-	newImage.BackgroundTransparency = 1
-	newImage.AnchorPoint = Vector2.new(0, .5)
-	newImage.Size = UDim2.new(0, imageWidth, 1, 0)
-	newImage.Position = UDim2.fromScale(2, 2)
-	images[ID] = newImage
+resolveMasterDeck()
+Master:GetAttributeChangedSignal("MasterSettings"):Connect(resolveMasterDeck)
+
+do
+	local counter = 0
+	local rate = 1 / refreshRate
+
+	runService.Heartbeat:Connect(function(deltaTime)
+		counter += deltaTime
+		if counter < rate then return end
+		counter %= rate
+
+		syncBeatState()
+		renderBars(SlaveBars, SlaveBarsNum, getSelfBeatState())
+		renderBars(MasterBars, MasterBarsNum, getMasterBeatState())
+	end)
 end
 
 LEDS["play button"].ClickDetector.MouseClick:Connect(function()
 	if not isPlaying then
 		if waveformLoop then return end
-		local counter = 0
-		local rate = 1 / refreshRate
-
-		waveformLoop = runService.Heartbeat:Connect(function(deltaTime)
-			counter += deltaTime
-
-			if counter >= rate then
-				counter -= rate
-				xPos -= waveformSpeed
-
-				if xPos <= -imageWidth then
-					xPos = 0; currentImage += 1
-					if currentImage > numWaveformParts then currentImage = 1 end
-				end
-
-				for index = 0, numVisibleImages - 1 do
-					local imageIndex = currentImage + index
-					if imageIndex > numWaveformParts then imageIndex -= numWaveformParts end
-					images[imageIndex].Position = UDim2.new(0, xPos + index*imageWidth, .5, 0)
-				end
-
-				LEDS["JOGWHEEL LED"].LED.ROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
-				LEDS["JOGWHEEL LED"].LED.SLIPROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
-				updateLoopOverlay()
-			end
-		end)
+		startWaveformLoop()
 
 		SCREEN.Changable.PlayerNumber.OnAir.Visible = true
 		mixer.VolumeMeter:Fire(PlayerNumber, true)
@@ -631,6 +835,7 @@ LEDS["TEMPO"].ClickDetector.MouseClick:Connect(function()
 
 	rangeLabel.Text = tempoLabel[currentTempo]
 	currentTempoPercentage = tempoPercentages[currentTempo]
+	changeTempo(currentTempoPercentage * lastFaderValue)
 end)
 
 LEDS["TEMPO RESET"].ClickDetector.MouseClick:Connect(function()
@@ -638,11 +843,18 @@ LEDS["TEMPO RESET"].ClickDetector.MouseClick:Connect(function()
 		LEDS["TEMPO RESET LED"].Material = Enum.Material.Neon
 		LEDS["TEMPO RESET LED"].Color = Color3.fromRGB(91, 154, 76)
 		bypassTempo = true
+
+		tempoMultiplier = 0
 		changeBPM(currentBPM)
+		applyWaveformScale()
+
+		SCREEN.Changable.Tempo.BigNum.Text = string.format("%.2f", 0)
+		SCREEN.Changable.Tempo.Sign.Text = ""
 	else
 		LEDS["TEMPO RESET LED"].Material = Enum.Material.SmoothPlastic
 		LEDS["TEMPO RESET LED"].Color = Color3.fromRGB(100, 100, 100)
 		bypassTempo = false
+		changeTempo(currentTempoPercentage * lastFaderValue)
 	end
 end)
 
@@ -714,8 +926,9 @@ end)
 
 faderControl.Event:Connect(function(fType: string, args: {dragPosition: number, range: number})
 	if fType == "speed" then
-		local faderValue = args.dragPosition / args.range
-		changeTempo(currentTempoPercentage * faderValue)
+		lastFaderValue = args.dragPosition / args.range
+		changeTempo(currentTempoPercentage * lastFaderValue)
+		
 	elseif fType == "jogwheel" then
 		local delta = args.dragPosition
 		if delta == 0 then return end
@@ -736,34 +949,17 @@ faderControl.Event:Connect(function(fType: string, args: {dragPosition: number, 
 			millisecs = tonumber(smallRemaining.Text)
 		}
 
-		local totalMs = (currentTime.minutes*60 + currentTime.seconds)*1000 + currentTime.millisecs
-		totalMs = math.clamp(totalMs + (direction*scrubAmount * 1000), 0, getTotalMs())
+		local remainingMs = (currentTime.minutes*60 + currentTime.seconds)*1000 + currentTime.millisecs
+		remainingMs = math.clamp(remainingMs + (direction*scrubAmount * 1000), 0, getTotalMs())
 
-		local newMs = totalMs % 1000
-		local newSecs = (totalMs // 1000) % 60
-		local newMins = totalMs // 60000
+		local newMs = remainingMs % 1000
+		local newSecs = (remainingMs // 1000) % 60
+		local newMins = remainingMs // 60000
 		bigRemaining.Text = string.format("%.2i:%.2i.", newMins, newSecs)
 		smallRemaining.Text = string.format("%.3i", newMs)
 
-		if setRemainingMs then setRemainingMs(totalMs) end
-
-		xPos = xPos + (direction*scrubAmount * waveformSpeed * 10)
-		local currentMs = getCurrentMs()
-		local isAtStart = currentMs <= 0
-		local waveformCenter = Waveform.AbsoluteSize.X/2
-
-        if xPos <= -imageWidth then
-            xPos = 0; currentImage = (currentImage % numWaveformParts) + 1
-        elseif xPos >= 0 and not isAtStart then
-            if currentImage > 1 then xPos -= imageWidth; currentImage -= 1 else xPos = math.max(xPos, 0) end
-        elseif isAtStart then
-            xPos = math.min(xPos, waveformCenter)
-        end
-
-        for index = 0, numVisibleImages - 1 do
-            local imageIndex = (currentImage + index - 1) % numWaveformParts + 1
-            images[imageIndex].Position = UDim2.new(0, xPos + index*imageWidth, .5, 0)
-        end
+		if setRemainingMs then setRemainingMs(remainingMs) end
+		jumpWaveformToMs(getTotalMs() - remainingMs)
 
 		local rotationAmount = direction*scrubAmount * 60
 		LEDS["JOGWHEEL LED"].LED.ROTATE.Rotation += rotationAmount * -1
@@ -780,31 +976,7 @@ faderControl.Event:Connect(function(fType: string, args: {dragPosition: number, 
 
 			if wasPlaying and not isPlaying and not waveformLoop then
 				isPlaying = true
-				local counter = 0
-				local rate = 1 / refreshRate
-
-				waveformLoop = runService.Heartbeat:Connect(function(deltaTime)
-					counter += deltaTime
-
-					if counter >= rate then
-						counter -= rate
-						xPos -= waveformSpeed
-
-						if xPos <= -imageWidth then
-							xPos = 0; currentImage += 1
-							if currentImage > numWaveformParts then currentImage = 1 end
-						end
-
-						for index = 0, numVisibleImages - 1 do
-							local imageIndex = currentImage + index
-							if imageIndex > numWaveformParts then imageIndex -= numWaveformParts end
-							images[imageIndex].Position = UDim2.new(0, xPos + index*imageWidth, .5, 0)
-						end
-
-						LEDS["JOGWHEEL LED"].LED.ROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
-						LEDS["JOGWHEEL LED"].LED.SLIPROTATE.Rotation += degPerUpdate * (1+tempoMultiplier)
-					end
-				end)
+				startWaveformLoop()
 			end
 		end)
 	end
@@ -865,6 +1037,8 @@ LEDS["BEAT SYNC"].ClickDetector.MouseClick:Connect(function()
 	
 	if LEDS["BEAT SYNC"].Color == Color3.fromRGB(25, 25, 25) then
 		changeBPM(MasterSettings.MasterBPM)
+		currentBPM = MasterSettings.MasterBPM
+
 		BPM.Visible = true
 		BPMMaster.Visible = false
 		
